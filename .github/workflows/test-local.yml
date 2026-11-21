@@ -41,9 +41,9 @@ jobs:
       # to download from the mini.
       - name: Local caches
         run: |
-          dir="$HOME/.cache/nature-ci"
+          dir="$HOME/.cache/nax-ci"
           mkdir -p "$dir/ccache"
-          echo "NATURE_CI_CACHE=$dir" >> "$GITHUB_ENV"
+          echo "NAX_CI_CACHE=$dir" >> "$GITHUB_ENV"
           echo "CCACHE_DIR=$dir/ccache" >> "$GITHUB_ENV"
 
       - name: Setup Go for package
@@ -60,8 +60,8 @@ jobs:
       - name: Test NLS
         working-directory: nls
         env:
-          NATURE_ROOT: ${{ github.workspace }}
-        run: CARGO_TARGET_DIR="$NATURE_CI_CACHE/nls-target" cargo test --all --locked
+          NAX_ROOT: ${{ github.workspace }}
+        run: CARGO_TARGET_DIR="$NAX_CI_CACHE/nls-target" cargo test --all --locked
 
       - name: Setup Musl for Linux
         if: ${{ contains(matrix.target, 'linux') }}
@@ -69,7 +69,7 @@ jobs:
 
       - name: LLaMA model file
         run: |
-          model="$NATURE_CI_CACHE/stories15M.bin"
+          model="$NAX_CI_CACHE/stories15M.bin"
           if [ ! -f "$model" ]; then
             echo "Downloading stories15M.bin model file..."
             wget -O "$model.tmp" https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin

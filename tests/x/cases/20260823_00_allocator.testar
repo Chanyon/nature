@@ -199,10 +199,10 @@ import "sops.x"
 // the allocatable box is built here where gc is available, the .x side then
 // reads the same allocator backed string
 fn main() {
-    var s = string.alloc(&ac.heap, 'nature'.ref(), 6)
+    var s = string.alloc(&ac.heap, 'nax'.ref(), 3)
     defer s.deinit()
 
-    println(s, s.len(), s == 'nature', s + '!')
+    println(s, s.len(), s == 'nax', s + '!')
     println(sops.count(s, 'a'.char()), sops.first(s))
 }
 
@@ -222,7 +222,7 @@ pub fn first(string s):u8 {
 }
 
 --- output.txt
-nature 6 true nature!
+nax 3 true nax!
 1 110
 
 === test_alloc_in_helper
@@ -236,7 +236,7 @@ fn make_list():vec<int> {
 }
 
 fn make_name():string {
-    return string.alloc(&ac.heap, 'nature'.ref(), 6)
+    return string.alloc(&ac.heap, 'nax'.ref(), 3)
 }
 
 fn main() {
@@ -251,4 +251,4 @@ fn main() {
 }
 
 --- output.txt
-3 7 nature 6
+3 7 nax 3

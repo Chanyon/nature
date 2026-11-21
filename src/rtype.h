@@ -1,5 +1,5 @@
-#ifndef NATURE_SRC_RTYPE_H_
-#define NATURE_SRC_RTYPE_H_
+#ifndef NAX_SRC_RTYPE_H_
+#define NAX_SRC_RTYPE_H_
 
 #include <inttypes.h>
 
@@ -985,4 +985,4 @@ static inline bool ct_rtype_has_ptr(type_t t) {
     return rtype->last_ptr > 0;
 }
 
-#endif //NATURE_SRC_RTYPE_H_
+#endif //NAX_SRC_RTYPE_H_
