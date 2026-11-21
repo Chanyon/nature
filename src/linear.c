@@ -420,12 +420,15 @@ static lir_operand_t *linear_default_string(module_t *m, type_t t, lir_operand_t
     lir_operand_t *elem_size_dst = indirect_addr_operand(m, type_kind_new(TYPE_INT64), target,
                                                          offsetof(n_string_t, element_size));
     lir_operand_t *hash_dst = indirect_addr_operand(m, type_kind_new(TYPE_INT64), target, offsetof(n_string_t, hash));
+    lir_operand_t *allocator_dst = indirect_addr_operand(m, type_kind_new(TYPE_ANYPTR), target,
+                                                         offsetof(n_string_t, allocator));
 
     OP_PUSH(lir_op_move(data_dst, int_operand(0)));
     OP_PUSH(lir_op_move(len_dst, int_operand(0)));
     OP_PUSH(lir_op_move(cap_dst, int_operand(0)));
     OP_PUSH(lir_op_move(elem_size_dst, int_operand(type_kind_sizeof(TYPE_UINT8))));
     OP_PUSH(lir_op_move(hash_dst, int_operand(type_hash(t))));
+    OP_PUSH(lir_op_move(allocator_dst, int_operand(0)));
 
     return target;
 }
@@ -443,6 +446,8 @@ static lir_operand_t *linear_string(module_t *m, type_t t, lir_operand_t *raw_st
     lir_operand_t *elem_size_dst = indirect_addr_operand(m, type_kind_new(TYPE_INT64), target,
                                                          offsetof(n_string_t, element_size));
     lir_operand_t *hash_dst = indirect_addr_operand(m, type_kind_new(TYPE_INT64), target, offsetof(n_string_t, hash));
+    lir_operand_t *allocator_dst = indirect_addr_operand(m, type_kind_new(TYPE_ANYPTR), target,
+                                                         offsetof(n_string_t, allocator));
 
     // string 是不可变对象，literal 可以直接引用 .data 段 raw_string
     OP_PUSH(lir_op_move(data_dst, raw_string));
@@ -450,6 +455,8 @@ static lir_operand_t *linear_string(module_t *m, type_t t, lir_operand_t *raw_st
     OP_PUSH(lir_op_move(cap_dst, int_operand(length + 1)));
     OP_PUSH(lir_op_move(elem_size_dst, int_operand(type_kind_sizeof(TYPE_UINT8))));
     OP_PUSH(lir_op_move(hash_dst, int_operand(type_hash(t))));
+    // a literal owns no memory, string.deinit leaves it alone
+    OP_PUSH(lir_op_move(allocator_dst, int_operand(0)));
 
     return target;
 }
@@ -1003,7 +1010,7 @@ static void linear_escape_rewrite(module_t *m, ast_var_decl_t *var_decl, bool fo
         dst = indirect_addr_operand(m, var_decl->type, heap_operand, 0);
     }
 
-    linear_super_move(m, var_decl->type, dst, src);
+    linear_store(m, var_decl->type, dst, src);
 }
 
 /**
@@ -1132,6 +1139,40 @@ static lir_operand_t *linear_ident(module_t *m, ast_expr_t expr, lir_operand_t *
     exit(1);
 }
 
+// a value with pointers, such as a string or a struct, copied as a block where the gc may have scanned already
+static bool linear_need_barrier_rtype(type_t t) {
+    return t.storage_kind == STORAGE_KIND_IND && ct_rtype_has_ptr(t);
+}
+
+static lir_operand_t *linear_value_ref(module_t *module, lir_operand_t *operand) {
+    if (operand->assert_type == LIR_OPERAND_VAR && lir_operand_type(operand).storage_kind != STORAGE_KIND_IND) {
+        return operand;
+    }
+    return lea_operand_pointer(module, operand);
+}
+
+/**
+ * write_barrier_rtype applies the hybrid barrier before copying a value with pointers.
+ * @param dst_ref the address the value goes to
+ * @param src the value
+ */
+static void linear_write_barrier_rtype(module_t *m, type_t t, lir_operand_t *dst_ref, lir_operand_t *src) {
+    lir_operand_t *src_ref = linear_value_ref(m, src);
+    push_rt_call(m, RT_CALL_WRITE_BARRIER_RTYPE, NULL, 4, dst_ref, src_ref, int_operand(t.storage_size),
+                 int_operand(type_hash(t)));
+}
+
+static void linear_store(module_t *module, type_t type, lir_operand_t *dst, lir_operand_t *src) {
+    if (!module->is_x && is_gc_alloc(type.kind)) {
+        push_rt_call(module, RT_CALL_WRITE_BARRIER, NULL, 2, lea_operand_pointer(module, dst), src);
+    } else if (!module->is_x && linear_need_barrier_rtype(type)) {
+        lir_operand_t *dst_ref = linear_value_ref(module, dst);
+        linear_write_barrier_rtype(module, type, dst_ref, src);
+    } else {
+        linear_super_move(module, type, dst, src);
+    }
+}
+
 /**
  * - 一旦将 addr 地址暴露出来，如果在 linear_expr 中存在 list push 操作就会造成 list.data 整体迁移，导致 addr 地址失效
  * - 应该总是优先编译右值，然后将右值 move 到左值中，避免出现 addr grow 的问题
@@ -1151,6 +1192,8 @@ static void linear_vec_assign(module_t *m, ast_assign_stmt_t *stmt) {
     if (vec_element_type.storage_kind == STORAGE_KIND_PTR || vec_element_type.kind == TYPE_ANYPTR) {
         // target 已经是指针了，不需要再次计算 slot
         push_rt_call(m, RT_CALL_WRITE_BARRIER, NULL, 2, target, src);
+    } else if (linear_need_barrier_rtype(vec_element_type)) {
+        linear_write_barrier_rtype(m, vec_element_type, target, src);
     } else {
         if (vec_element_type.storage_kind == STORAGE_KIND_DIR) {
             target = indirect_addr_operand(m, vec_element_type, target, 0);
@@ -1168,6 +1211,10 @@ static void linear_array_assign(module_t *m, ast_assign_stmt_t *stmt) {
         lir_operand_t *dst_slot = lea_operand_pointer(m, target);
 
         push_rt_call(m, RT_CALL_WRITE_BARRIER, NULL, 2, dst_slot, new_obj);
+    } else if (linear_need_barrier_rtype(stmt->left.type)) {
+        lir_operand_t *src = linear_expr(m, stmt->right, NULL);
+        lir_operand_t *dst_ref = lea_operand_pointer(m, target);
+        linear_write_barrier_rtype(m, stmt->left.type, dst_ref, src);
     } else {
         linear_expr(m, stmt->right, target);
     }
@@ -1189,6 +1236,10 @@ static void linear_tuple_assign(module_t *m, ast_assign_stmt_t *stmt) {
         lir_operand_t *obj = linear_expr(m, stmt->right, NULL);
         lir_operand_t *dst_slot = lea_operand_pointer(m, dst);
         push_rt_call(m, RT_CALL_WRITE_BARRIER, NULL, 2, dst_slot, obj);
+    } else if (linear_need_barrier_rtype(stmt->left.type)) {
+        lir_operand_t *src = linear_expr(m, stmt->right, NULL);
+        lir_operand_t *dst_ref = lea_operand_pointer(m, dst);
+        linear_write_barrier_rtype(m, stmt->left.type, dst_ref, src);
     } else {
         if (stmt->left.type.storage_kind == STORAGE_KIND_IND) {
             dst = lea_operand_pointer(m, dst);
@@ -1237,7 +1288,9 @@ static void linear_env_assign(module_t *m, ast_assign_stmt_t *stmt) {
         lir_operand_t *dst_ptr = temp_var_operand(m, type_refof(stmt->right.type));
         OP_PUSH(lir_op_move(dst_ptr, env_offset_operand)); // mov env_values[0] -> dst_ptr
 
-        if (stmt->left.type.storage_kind == STORAGE_KIND_IND) {
+        if (linear_need_barrier_rtype(stmt->left.type)) {
+            linear_write_barrier_rtype(m, stmt->left.type, dst_ptr, src);
+        } else if (stmt->left.type.storage_kind == STORAGE_KIND_IND) {
             linked_concat(m->current_closure->operations, lir_memory_mov(m, size, dst_ptr, src));
         } else {
             lir_operand_t *dst = indirect_addr_operand(m, stmt->left.type, dst_ptr, 0);
@@ -1266,6 +1319,9 @@ static void linear_map_assign(module_t *m, ast_assign_stmt_t *stmt) {
         // 不包含 struct/array
         lir_operand_t *obj = linear_expr(m, stmt->right, NULL);
         push_rt_call(m, RT_CALL_WRITE_BARRIER, NULL, 2, dst, obj);
+    } else if (linear_need_barrier_rtype(stmt->left.type)) {
+        lir_operand_t *src = linear_expr(m, stmt->right, NULL);
+        linear_write_barrier_rtype(m, stmt->left.type, dst, src);
     } else {
         if (stmt->right.type.storage_kind != STORAGE_KIND_IND) {
             dst = indirect_addr_operand(m, stmt->right.type, dst, 0);
@@ -1309,6 +1365,10 @@ static void linear_struct_assign(module_t *m, ast_assign_stmt_t *stmt) {
         //        obj = lea_operand_pointer(m, obj);
 
         push_rt_call(m, RT_CALL_WRITE_BARRIER, NULL, 2, dst_slot, obj);
+    } else if (linear_need_barrier_rtype(stmt->left.type)) {
+        lir_operand_t *src = linear_expr(m, stmt->right, NULL);
+        lir_operand_t *dst_ref = lea_operand_pointer(m, dst_slot);
+        linear_write_barrier_rtype(m, stmt->left.type, dst_ref, src);
     } else {
         // lea [rax+16], rcx
         if (stmt->left.type.storage_kind == STORAGE_KIND_IND) {
@@ -1327,6 +1387,17 @@ static void linear_ia_ptr_assign(module_t *m, ast_assign_stmt_t *stmt) {
     lir_operand_t *src = linear_expr(m, stmt->right, NULL);
 
     lir_operand_t *ptr_operand = linear_expr(m, unary_expr->operand, NULL);
+
+    // the pointer can point into the heap, as a field or an element does
+    if (is_gc_alloc(stmt->left.type.kind)) {
+        push_rt_call(m, RT_CALL_WRITE_BARRIER, NULL, 2, ptr_operand, src);
+        return;
+    }
+
+    if (linear_need_barrier_rtype(stmt->left.type)) {
+        linear_write_barrier_rtype(m, stmt->left.type, ptr_operand, src);
+        return;
+    }
 
     // *ptr = [a, b, c]
     // *ptr = 12
@@ -1354,6 +1425,19 @@ static void linear_ident_assign(module_t *m, ast_assign_stmt_t *stmt) {
     lir_operand_t *dst = linear_ident(m, stmt->left, NULL); // ident
 
     assert(stmt->left.type.kind > 0 && stmt->left.type.kind != TYPE_UNKNOWN);
+
+    ast_ident *ident = stmt->left.value;
+    symbol_t *symbol = symbol_table_get_noref(ident->literal);
+    if (symbol && symbol->type == SYMBOL_VAR) {
+        ast_var_decl_t *var_decl = symbol->ast_value;
+        bool heap_value = var_decl->heap_ident ||
+                          (var_decl->type.storage_kind == STORAGE_KIND_IND && var_decl->type.in_heap);
+        if (!symbol->is_local || heap_value) {
+            linear_store(m, stmt->left.type, dst, src);
+            return;
+        }
+    }
+
     linear_super_move(m, stmt->left.type, dst, src);
 }
 
@@ -1445,7 +1529,11 @@ static void linear_var_tuple_destr(module_t *m, ast_tuple_destr_t *destr, lir_op
             ast_var_decl_t *var_decl = element->value;
             lir_operand_t *dst = linear_var_decl(m, var_decl);
 
-            linear_super_move(m, element->type, dst, element_src_operand);
+            if (var_decl->type.in_heap && var_decl->type.storage_kind == STORAGE_KIND_IND) {
+                linear_store(m, element->type, dst, element_src_operand);
+            } else {
+                linear_super_move(m, element->type, dst, element_src_operand);
+            }
 
             // var *t1 = 12
             linear_escape_rewrite(m, var_decl, false);
@@ -1496,7 +1584,11 @@ static void linear_vardef(module_t *m, ast_vardef_stmt_t *stmt) {
         linear_expr(m, *stmt->right, dst);
     } else {
         lir_operand_t *src = linear_expr(m, *stmt->right, NULL);
-        linear_super_move(m, stmt->var_decl.type, dst, src);
+        if (stmt->var_decl.type.in_heap && stmt->var_decl.type.storage_kind == STORAGE_KIND_IND) {
+            linear_store(m, stmt->var_decl.type, dst, src);
+        } else {
+            linear_super_move(m, stmt->var_decl.type, dst, src);
+        }
     }
 
     // 将 dst 值 copy 出来进行重新分配改写
@@ -2046,17 +2138,17 @@ static lir_operand_t *linear_call_impl(module_t *m, ast_expr_t expr, lir_operand
             /**
              * typedef struct {
              *   value_casting value;
-             *   int64_t *methods;
-             *   rtype_t *rtype;
-             *   int64_t method_count;
+             *   n_vtable_t *vtable; // { rtype_t *rtype; void *methods[]; }
              * } n_interface_t;
              */
-            lir_operand_t *methods_target = temp_var_operand(m, type_kind_new(TYPE_ANYPTR));
-            lir_operand_t *src = indirect_addr_operand(m, type_kind_new(TYPE_ANYPTR), interface_target, POINTER_SIZE);
-            OP_PUSH(lir_op_move(methods_target, src));
+            lir_operand_t *vtable_target = temp_var_operand(m, type_kind_new(TYPE_ANYPTR));
+            lir_operand_t *src = indirect_addr_operand(m, type_kind_new(TYPE_ANYPTR), interface_target,
+                                                       offsetof(n_interface_t, vtable));
+            OP_PUSH(lir_op_move(vtable_target, src));
 
             fn_target = temp_var_operand(m, *interface_fn_type); // fn target 可以直接调用
-            src = indirect_addr_operand(m, *interface_fn_type, methods_target, POINTER_SIZE * index);
+            src = indirect_addr_operand(m, *interface_fn_type, vtable_target,
+                                        offsetof(n_vtable_t, methods) + POINTER_SIZE * index);
             OP_PUSH(lir_op_move(fn_target, src));
             type_fn = interface_fn_type->fn;
 
@@ -2131,8 +2223,7 @@ static lir_operand_t *linear_call_impl(module_t *m, ast_expr_t expr, lir_operand
                         arg_dst_target = indirect_addr_operand(m, vec_element_type, arg_dst_target, 0);
                     }
 
-                    // 直接进行 mov
-                    linear_super_move(m, vec_element_type, arg_dst_target, rest_src_target);
+                    linear_store(m, vec_element_type, arg_dst_target, rest_src_target);
                 }
 
                 index += 1;
@@ -2582,8 +2673,7 @@ static lir_operand_t *linear_vec_new(module_t *m, ast_expr_t expr, lir_operand_t
                     item_dst_target = indirect_addr_operand(m, vec_element_type, item_dst_target, 0);
                 }
 
-                // 直接进行 mov
-                linear_super_move(m, vec_element_type, item_dst_target, item_src_target);
+                linear_store(m, vec_element_type, item_dst_target, item_src_target);
             }
         }
     }
@@ -2680,7 +2770,12 @@ static lir_operand_t *linear_array_new(module_t *m, ast_expr_t expr, lir_operand
 
         if (i < ast->elements->length) {
             ast_expr_t *item_expr = ct_list_value(ast->elements, i);
-            linear_expr(m, *item_expr, item_target);
+            if (arr_in_heap) {
+                lir_operand_t *item_src = linear_expr(m, *item_expr, NULL);
+                linear_store(m, type_array.array->element_type, item_target, item_src);
+            } else {
+                linear_expr(m, *item_expr, item_target);
+            }
         } else {
             linear_default_operand(m, type_array.array->element_type, item_target);
         }
@@ -2714,7 +2809,11 @@ static lir_operand_t *linear_array_repeat_new(module_t *m, ast_expr_t expr, lir_
             item_target = indirect_addr_operand(m, type_array.array->element_type, item_target, 0);
         }
 
-        linear_super_move(m, type_array.array->element_type, item_target, default_element_target);
+        if (type_array.in_heap) {
+            linear_store(m, type_array.array->element_type, item_target, default_element_target);
+        } else {
+            linear_super_move(m, type_array.array->element_type, item_target, default_element_target);
+        }
     }
 
     return target;
@@ -2852,7 +2951,8 @@ static lir_operand_t *linear_map_new(module_t *m, ast_expr_t expr, lir_operand_t
             value_ptr_target = indirect_addr_operand(m, map_type.map->value_type, value_ptr_target, 0);
         }
 
-        linear_expr(m, element->value, value_ptr_target);
+        lir_operand_t *value_src = linear_expr(m, element->value, NULL);
+        linear_store(m, map_type.map->value_type, value_ptr_target, value_src);
     }
 
     return target;
@@ -2986,7 +3086,12 @@ static lir_operand_t *linear_struct_new(module_t *m, ast_expr_t expr, lir_operan
             dst = lea_operand_pointer(m, dst);
         }
 
-        linear_expr(m, *property_expr, dst);
+        if (t.in_heap) {
+            lir_operand_t *src = linear_expr(m, *property_expr, NULL);
+            linear_store(m, p->type, dst, src);
+        } else {
+            linear_expr(m, *property_expr, dst);
+        }
     }
 
     linear_struct_fill_default(m, t, target, exists);
@@ -3024,7 +3129,12 @@ static lir_operand_t *linear_tuple_new(module_t *m, ast_expr_t expr, lir_operand
             dst = lea_operand_pointer(m, dst);
         }
 
-        linear_expr(m, *element, dst);
+        if (expr.type.in_heap) {
+            lir_operand_t *src = linear_expr(m, *element, NULL);
+            linear_store(m, element->type, dst, src);
+        } else {
+            linear_expr(m, *element, dst);
+        }
 
         offset += element_size;
     }
@@ -3105,7 +3215,8 @@ static lir_operand_t *linear_new_expr(module_t *m, ast_expr_t expr, lir_operand_
                 dst = lea_operand_pointer(m, dst);
             }
 
-            linear_expr(m, *property_expr, dst);
+            lir_operand_t *src = linear_expr(m, *property_expr, NULL);
+            linear_store(m, p->type, dst, src);
         }
         linear_struct_fill_default(m, new_expr->type, target, exists);
     } else {
@@ -3120,7 +3231,7 @@ static lir_operand_t *linear_new_expr(module_t *m, ast_expr_t expr, lir_operand_
                 dst = indirect_addr_operand(m, new_expr->type, target, 0);
             }
 
-            linear_super_move(m, new_expr->type, dst, src);
+            linear_store(m, new_expr->type, dst, src);
         }
     }
 
@@ -3245,6 +3356,81 @@ static lir_operand_t *linear_is_expr(module_t *m, ast_expr_t expr, lir_operand_t
     }
 
     return target;
+}
+
+/**
+ * the vtable of a type as an interface: the rtype, then the method addresses in the order the
+ * interface declares them. it is a global symbol whose addresses the linker fills in, so every
+ * interface value can keep pointing at it. like a string literal, conversions with the same content
+ * share one per module.
+ */
+static char *linear_interface_vtable(module_t *m, ast_typedef_stmt_t *typedef_stmt, char *type_ident,
+                                     uint64_t rtype_hash, type_interface_t *interface_type) {
+    slice_t *fn_idents = slice_new();
+    char *key = str_connect("v:", itoa(rtype_hash));
+    for (int i = 0; i < interface_type->elements->length; ++i) {
+        type_t *temp = ct_list_value(interface_type->elements, i);
+        assert(temp->kind == TYPE_FN);
+        type_fn_t *interface_fn_type = temp->fn;
+        assert(interface_fn_type->fn_name);
+
+        // 按照 union type 中的定义顺序写入
+        char *fn_ident = str_connect_by(type_ident, interface_fn_type->fn_name, IMPL_CONNECT_IDENT);
+
+        ast_fndef_t *ast_fndef = sc_map_get_sv(&typedef_stmt->method_table, fn_ident);
+        assert(ast_fndef);
+        symbol_t *fn_symbol = symbol_table_get(fn_ident);
+        assert(fn_symbol);
+
+        if (ast_fndef->receiver_wrapper_ident) {
+            symbol_t *wrapper_fn_symbol = symbol_table_get(ast_fndef->receiver_wrapper_ident);
+            assert(wrapper_fn_symbol);
+
+            ast_fndef = wrapper_fn_symbol->ast_value;
+            fn_ident = ast_fndef->symbol_name;
+        }
+
+        // string self is string, self is ptr,not need receiver_wrapper
+        // assert(ast_fndef->self_kind != PARAM_SELF_T);
+
+        if (ast_fndef->linkid) {
+            fn_ident = ast_fndef->linkid;
+        }
+
+        slice_push(fn_idents, fn_ident);
+        key = str_connect_by(key, fn_ident, ",");
+    }
+
+    asm_global_symbol_t *vtable = table_get(m->global_symbol_table, key);
+    if (vtable) {
+        return vtable->name;
+    }
+
+    vtable = NEW(asm_global_symbol_t);
+    vtable->name = label_ident_with_prefix(m, "vtable");
+    vtable->size = sizeof(n_vtable_t) + fn_idents->count * POINTER_SIZE;
+    vtable->alignment = POINTER_SIZE;
+    vtable->value = mallocz(vtable->size);
+    vtable->relocs = slice_new();
+
+    // rt_rtype_data holds the rtypes in registration order
+    asm_global_reloc_t *rtype_reloc = NEW(asm_global_reloc_t);
+    rtype_reloc->offset = offsetof(n_vtable_t, rtype);
+    rtype_reloc->name = SYMBOL_RTYPE_DATA;
+    rtype_reloc->addend = ct_rtype_index(rtype_hash) * (int64_t) sizeof(rtype_t);
+    slice_push(vtable->relocs, rtype_reloc);
+
+    for (int i = 0; i < fn_idents->count; ++i) {
+        asm_global_reloc_t *fn_reloc = NEW(asm_global_reloc_t);
+        fn_reloc->offset = offsetof(n_vtable_t, methods) + i * POINTER_SIZE;
+        fn_reloc->name = fn_idents->take[i];
+        fn_reloc->is_fn = true;
+        slice_push(vtable->relocs, fn_reloc);
+    }
+
+    slice_push(m->current_closure->asm_symbols, vtable);
+    table_set(m->global_symbol_table, key, vtable);
+    return vtable->name;
 }
 
 /**
@@ -3501,8 +3687,7 @@ static lir_operand_t *linear_as_expr(module_t *m, ast_expr_t expr, lir_operand_t
     }
 
     if (as_expr->target_type.kind == TYPE_INTERFACE) {
-        // x mode has no gc, interface_casting aliases the method table and the boxed value instead
-        bool is_x = m->is_x;
+        // infer lets .x convert only a pointer, so the value is boxed in .n only
         lir_operand_t *interface_value;
         if (as_expr->src.type.storage_kind == STORAGE_KIND_IND) {
             interface_value = temp_var_operand(m, type_kind_new(TYPE_ANYPTR));
@@ -3532,60 +3717,15 @@ static lir_operand_t *linear_as_expr(module_t *m, ast_expr_t expr, lir_operand_t
         ast_typedef_stmt_t *typedef_stmt = s->ast_value;
         assert(!typedef_stmt->is_interface);
 
-        if (interface_type->elements->length > 0) {
-            // alloc stack
-            type_t methods_type_arr = type_array_new(TYPE_ANYPTR, interface_type->elements->length);
-            lir_operand_t *methods_target = temp_var_operand_with_alloc(m, methods_type_arr);
+        // an interface with no methods still needs the rtype, so every conversion has a vtable
+        lir_symbol_var_t *vtable_symbol = NEW(lir_symbol_var_t);
+        vtable_symbol->ident = linear_interface_vtable(m, typedef_stmt, src_type.ident, src_rtype_hash,
+                                                       interface_type);
+        vtable_symbol->t = type_kind_new(TYPE_ANYPTR);
+        lir_operand_t *vtable_ref = temp_var_operand(m, type_kind_new(TYPE_ANYPTR));
+        OP_PUSH(lir_op_lea(vtable_ref, operand_new(LIR_OPERAND_SYMBOL_VAR, vtable_symbol)));
 
-            // fn label to stack by interface fn sequence
-            for (int i = 0; i < interface_type->elements->length; ++i) {
-                type_t *temp = ct_list_value(interface_type->elements, i);
-                assert(temp->kind == TYPE_FN);
-                type_fn_t *interface_fn_type = temp->fn;
-                assert(interface_fn_type->fn_name);
-
-                // 按照 union type 中的定义顺序写入
-                char *fn_ident = str_connect_by(src_type.ident, interface_fn_type->fn_name, IMPL_CONNECT_IDENT);
-
-                ast_fndef_t *ast_fndef = sc_map_get_sv(&typedef_stmt->method_table, fn_ident);
-                assert(ast_fndef);
-                symbol_t *fn_symbol = symbol_table_get(fn_ident);
-                assert(fn_symbol);
-
-                if (ast_fndef->receiver_wrapper_ident) {
-                    symbol_t *wrapper_fn_symbol = symbol_table_get(ast_fndef->receiver_wrapper_ident);
-                    assert(wrapper_fn_symbol);
-
-                    ast_fndef = wrapper_fn_symbol->ast_value;
-                    fn_ident = ast_fndef->symbol_name;
-                }
-
-                // string self is string, self is ptr,not need receiver_wrapper
-                // assert(ast_fndef->self_kind != PARAM_SELF_T);
-
-                if (ast_fndef->linkid) {
-                    fn_ident = ast_fndef->linkid;
-                }
-
-                // lea fn_label to stack
-                lir_operand_t *fn_label = lir_label_operand(fn_ident, false);
-                // methods 需要通过 c 传递，为了让其符合 c 的 abi, 这里需要将其转换位 anyptr 进行传递
-                lir_var_t *var = methods_target->value;
-                var->type = type_kind_new(TYPE_ANYPTR);
-                lir_operand_t *item_target = indirect_addr_operand(m, type_kind_new(TYPE_ANYPTR), methods_target,
-                                                                   i * POINTER_SIZE);
-                OP_PUSH(lir_op_lea(item_target, fn_label));
-            }
-
-            push_rt_call(m, RT_CALL_INTERFACE_CASTING, NULL, 6, out_ptr, int_operand(src_rtype_hash), interface_value,
-                         int_operand(interface_type->elements->length),
-                         methods_target, bool_operand(is_x));
-        } else {
-            push_rt_call(m, RT_CALL_INTERFACE_CASTING, NULL, 6, out_ptr, int_operand(src_rtype_hash), interface_value,
-                         int_operand(0),
-                         int_operand(0), bool_operand(is_x));
-        }
-
+        push_rt_call(m, RT_CALL_INTERFACE_CASTING, NULL, 3, out_ptr, vtable_ref, interface_value);
         return target;
     }
 

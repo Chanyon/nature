@@ -78,7 +78,7 @@ hello 1.100000
 import allocator as ac
 
 fn main() {
-    var list = vec<u8>.alloc(ac.heap, 200 as u8, 10)
+    var list = vec<u8>.alloc(&ac.heap, 200 as u8, 10)
     defer list.deinit()
 
     println(list[0], list[9])
@@ -103,6 +103,8 @@ fn main() {
     defer ar.deinit()
 
     var list = vec<int>.alloc(ar, 0, 3)
+    // the allocator box (16) and the elements (24) both come from the arena
+    println(ar.current.used)
     for int i = 0; i < 3; i += 1 {
         list[i] = i * 10
     }
@@ -111,6 +113,7 @@ fn main() {
 }
 
 --- output.txt
+40
 4 0 20 99
 
 === test_vec_from_n
@@ -121,7 +124,7 @@ import "vops.x"
 // the allocatable box is built here where gc is available, the .x side then
 // reads, writes and pushes on the same allocator backed vec
 fn main() {
-    var list = vec<u8>.alloc(ac.heap, 0 as u8, 4)
+    var list = vec<u8>.alloc(&ac.heap, 0 as u8, 4)
     defer list.deinit()
 
     vops.fill(list, 10)
@@ -154,3 +157,98 @@ pub fn grow_total(vec<u8> v, int n):int {
 --- output.txt
 10 13 46
 7008
+
+=== test_string_alloc
+--- main.x
+import allocator as ac
+import allocator.arena
+import libc
+
+fn main() {
+    string lit = 'hello'
+    var s = string.alloc(&ac.heap, lit.ref(), lit.len())
+    defer s.deinit()
+    println(s, s.len(), s.char(), s == lit)
+
+    // a literal owns no memory, deinit leaves it alone
+    lit.deinit()
+    println(lit)
+
+    var ar = arena.init(4096)
+    defer ar.deinit()
+
+    // leave 'x' bytes in the arena: the vec data is the last alloc, so deinit hands it back
+    var junk = vec<u8>.alloc(ar, 120 as u8, 64)
+    junk.deinit()
+
+    // the string lands on those bytes, strlen stops at the NUL string.alloc writes
+    var w = string.alloc(ar, 'world'.ref(), 5)
+    println(w, libc.strlen(w.to_cstr()))
+}
+
+--- output.txt
+hello 5 104 true
+hello
+world 5
+
+=== test_string_from_n
+--- main.n
+import allocator as ac
+import "sops.x"
+
+// the allocatable box is built here where gc is available, the .x side then
+// reads the same allocator backed string
+fn main() {
+    var s = string.alloc(&ac.heap, 'nax'.ref(), 3)
+    defer s.deinit()
+
+    println(s, s.len(), s == 'nax', s + '!')
+    println(sops.count(s, 'a'.char()), sops.first(s))
+}
+
+--- sops.x
+pub fn count(string s, u8 c):int {
+    int n = 0
+    for v in s {
+        if v == c {
+            n += 1
+        }
+    }
+    return n
+}
+
+pub fn first(string s):u8 {
+    return s.char()
+}
+
+--- output.txt
+nax 3 true nax!
+1 110
+
+=== test_alloc_in_helper
+--- main.x
+import allocator as ac
+
+// &ac.heap becomes an allocatable inside the helpers. the vec and the string keep it, so push and
+// deinit call through its vtable after the helpers return
+fn make_list():vec<int> {
+    return vec<int>.alloc(&ac.heap, 0, 2)
+}
+
+fn make_name():string {
+    return string.alloc(&ac.heap, 'nax'.ref(), 3)
+}
+
+fn main() {
+    var list = make_list()
+    defer list.deinit()
+    list.push(7)
+
+    var name = make_name()
+    defer name.deinit()
+
+    println(list.len(), list[2], name, name.len())
+}
+
+--- output.txt
+3 7 nax 3

@@ -39,7 +39,7 @@ void union_to_any(n_any_t *out, n_union_t *input, n_bool_t is_x);
 
 void tagged_union_casting(n_tagged_union_t *out, int64_t id, int64_t value_rtype_hash, void *value_ref);
 
-void interface_casting(n_interface_t *out, uint64_t input_rtype_hash, void *value_ref, int64_t method_count, int64_t *methods, n_bool_t is_x);
+void interface_casting(n_interface_t *out, n_vtable_t *vtable, void *value_ref);
 
 int64_t iterator_next_key(void *iterator, uint64_t rtype_hash, int64_t cursor, void *key_ref);
 
@@ -67,7 +67,13 @@ void rti_write_barrier_ptr(void *slot, void *new_obj, bool mark_black_new_obj);
 
 void rti_write_barrier_rtype(void *dst, void *src, rtype_t *rtype);
 
+void rti_write_barrier_array(void *dst, void *src, rtype_t *rtype, uint64_t count);
+
+void rti_shade_rtype(void *p, rtype_t *rtype);
+
 void write_barrier(void *slot, void *new_obj);
+
+void write_barrier_rtype(void *dst, void *src, int64_t size, int64_t rtype_hash);
 
 void ptr_valid(void *ptr);
 
